@@ -44,7 +44,9 @@
 enum {
     IDC_PATH = 1001,
     IDC_BROWSE,
-    IDC_ENCRYPT,
+    IDC_ENCRYPT,   // encrypt strings
+    IDC_ENCCODE,   // encrypt code section
+    IDC_PROTECT,   // both passes in one click
     IDC_INFO,
 };
 
@@ -367,6 +369,32 @@ static const size_t kStubLen  = sizeof(kStub);
 static const size_t kOffTable = 2;
 static const size_t kOffCount = 11;
 static const size_t kOffOep   = 88;
+static const size_t kCoreLen  = 86;   // kStub up to (not incl.) the movabs rax/jmp tail ("done")
+
+// The code-encryption pass runs the SAME decrypt core as a TLS callback instead
+// of at the entry point, so it fires before the target's own TLS callbacks and
+// its real entry (most compiled exes have TLS callbacks). A TLS callback is
+// callback(PVOID,DWORD Reason,PVOID) — Reason in edx — and fires at attach AND
+// detach, so we decrypt only on DLL_PROCESS_ATTACH (1) and `ret` otherwise, or
+// the detach call would XOR the code a second time and re-encrypt it on exit.
+// The decrypt core is byte-identical to kStub's; only the framing differs, so
+// the core's internal relative branches stay valid.
+static std::vector<BYTE> MakeTlsStub(size_t& offTable, size_t& offCount) {
+    std::vector<BYTE> s = {
+        0x83,0xfa,0x01,   // cmp edx, 1 (DLL_PROCESS_ATTACH)
+        0x74,0x01,        // je +1  (into push rsi)
+        0xc3,             // ret    (other reasons: do nothing)
+        0x56,             // push rsi
+        0x57,             // push rdi
+    };
+    s.insert(s.end(), kStub, kStub + kCoreLen);  // shared decrypt core (ends at "done")
+    s.push_back(0x5f);    // pop rdi
+    s.push_back(0x5e);    // pop rsi
+    s.push_back(0xc3);    // ret
+    offTable = 8 + kOffTable;   // 6-byte guard + push rsi/rdi + core table offset
+    offCount = 8 + kOffCount;
+    return s;
+}
 
 // Keystream must match the stub exactly: advance xorshift32, then use low byte.
 static inline uint32_t xorshift32(uint32_t x) {
@@ -617,14 +645,280 @@ static PackResult PackStrings(const std::wstring& inPath, const std::wstring& ou
     return PackResult{ true, m.str() };
 }
 
-// Suggest "<name>_protected.exe" next to the input, for the Save dialog.
-static std::wstring DefaultProtectedName(const std::wstring& in) {
+// ===========================================================================
+//  Code-encryption pass — the "Encrypt code" button.
+//
+//  Encrypts the target's code section (.text) in place and appends a decryptor
+//  stub (a new ".pakc" section). If the target has TLS callbacks (most compiled
+//  exes do) the stub is prepended to the TLS callback array so it runs before
+//  any real code; otherwise it is installed at the entry point. The code section
+//  is marked writable so the loader maps it RWX and the stub decrypts in place.
+//  On disk the code is ciphertext, so IDA's static view shows garbage until the
+//  program runs. Composes with PackStrings (.pak vs .pakc; each pass captures the
+//  current entry so the stubs chain). Defeats static analysis only — a runtime
+//  dump still recovers the code. For protecting software you own.
+// ===========================================================================
+static PackResult PackCode(const std::wstring& inPath, const std::wstring& outPath) {
+    auto err = [](std::wstring m) { return PackResult{ false, std::move(m) }; };
+
+    std::vector<BYTE> img;
+    if (!LoadFileBytes(inPath, img)) return err(OBF(L"Could not read the input file.").str());
+
+    auto at = [&](size_t off) -> BYTE* { return img.data() + off; };
+    auto in = [&](size_t off, size_t len) { return off + len <= img.size(); };
+
+    // ---- parse + validate headers --------------------------------------
+    if (!in(0, sizeof(IMAGE_DOS_HEADER))) return err(OBF(L"File is too small to be a PE.").str());
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(at(0));
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return err(OBF(L"Not a PE file (missing 'MZ').").str());
+    DWORD peOff = dos->e_lfanew;
+    if (!in(peOff, sizeof(IMAGE_NT_HEADERS64))) return err(OBF(L"Not a PE file (truncated).").str());
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(at(peOff));
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return err(OBF(L"Not a PE file (missing 'PE\\0\\0').").str());
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
+        return err(OBF(L"Only x64 (AMD64) executables are supported.").str());
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return err(OBF(L"Only PE32+ (64-bit) is supported.").str());
+    if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL)
+        return err(OBF(L"DLLs are not supported (EXE only).").str());
+
+    IMAGE_OPTIONAL_HEADER64& opt = nt->OptionalHeader;
+    if (opt.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
+        opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress)
+        return err(OBF(L".NET assemblies are not supported.").str());
+
+    const uint64_t imageBase = opt.ImageBase;
+    const uint32_t fileAlign = opt.FileAlignment;
+    const uint32_t secAlign  = opt.SectionAlignment;
+    auto alignUp = [](uint64_t v, uint64_t a) { return (v + a - 1) / a * a; };
+
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    const WORD nSec = nt->FileHeader.NumberOfSections;
+    for (WORD i = 0; i < nSec; ++i)
+        if (std::memcmp(sec[i].Name, ".pakc", 5) == 0)
+            return err(OBF(L"This file is already code-encrypted.").str());
+
+    auto rvaToOff = [&](uint32_t rva) -> uint32_t {
+        if (rva < opt.SizeOfHeaders) return rva;
+        for (WORD i = 0; i < nSec; ++i) {
+            uint32_t va = sec[i].VirtualAddress;
+            uint32_t span = (std::max)(sec[i].Misc.VirtualSize, sec[i].SizeOfRawData);
+            if (rva >= va && rva < va + span) return sec[i].PointerToRawData + (rva - va);
+        }
+        return 0;
+    };
+
+    // ---- gather TLS callbacks (we hook ahead of them, not refuse) -------
+    std::vector<uint64_t> tlsCallbacks;
+    uint32_t tlsDirFileOff = 0;
+    {
+        auto& tlsDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+        if (tlsDir.VirtualAddress && tlsDir.Size) {
+            uint32_t o = rvaToOff(tlsDir.VirtualAddress);
+            if (o && in(o, sizeof(IMAGE_TLS_DIRECTORY64))) {
+                auto tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(at(o));
+                if (tls->AddressOfCallBacks >= imageBase) {
+                    uint32_t arrRva = (uint32_t)(tls->AddressOfCallBacks - imageBase);
+                    uint32_t arrOff = rvaToOff(arrRva);
+                    for (uint32_t k = 0; arrOff && in(arrOff + k * 8, 8) && k < 4096; ++k) {
+                        uint64_t cb; std::memcpy(&cb, at(arrOff + k * 8), 8);
+                        if (!cb) break;
+                        tlsCallbacks.push_back(cb);
+                    }
+                    if (!tlsCallbacks.empty()) tlsDirFileOff = o;
+                }
+            }
+        }
+    }
+    const bool hookTls = tlsDirFileOff != 0;
+
+    // ---- build the loader-critical exclusion list ----------------------
+    std::vector<PackSpan> ex;
+    ex.push_back({ 0, opt.SizeOfHeaders });
+    for (DWORD i = 0; i < opt.NumberOfRvaAndSizes && i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; ++i) {
+        auto& d = opt.DataDirectory[i];
+        if (d.VirtualAddress && d.Size) ex.push_back({ d.VirtualAddress, d.VirtualAddress + d.Size });
+    }
+    {
+        auto& impDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        uint32_t off = impDir.VirtualAddress ? rvaToOff(impDir.VirtualAddress) : 0;
+        int guard = 0;
+        while (off && in(off, sizeof(IMAGE_IMPORT_DESCRIPTOR)) && ++guard < 4096) {
+            auto imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(at(off));
+            if (imp->Name == 0 && imp->FirstThunk == 0) break;
+            if (imp->Name) {
+                uint32_t nameOff = rvaToOff(imp->Name), n = 0;
+                while (nameOff && in(nameOff + n, 1) && img[nameOff + n]) ++n;
+                ex.push_back({ imp->Name, imp->Name + n + 1 });
+            }
+            for (int which = 0; which < 2; ++which) {
+                uint32_t arrRva = which ? imp->FirstThunk : imp->OriginalFirstThunk;
+                if (!arrRva) continue;
+                uint32_t arrOff = rvaToOff(arrRva), k = 0;
+                while (arrOff && in(arrOff + k * 8, 8)) {
+                    uint64_t t; std::memcpy(&t, at(arrOff + k * 8), 8);
+                    if (!t) break;
+                    if (!(t & IMAGE_ORDINAL_FLAG64)) {
+                        uint32_t ibnRva = (uint32_t)(t & 0x7fffffff);
+                        uint32_t ibnOff = rvaToOff(ibnRva), n = 0;
+                        while (ibnOff && in(ibnOff + 2 + n, 1) && img[ibnOff + 2 + n]) ++n;
+                        ex.push_back({ ibnRva, ibnRva + 2 + n + 1 });
+                    }
+                    ++k;
+                }
+                ex.push_back({ arrRva, arrRva + (k + 1) * 8 });
+            }
+            off += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        }
+    }
+
+    // ---- pick the code section (prefer ".text", skip our own stubs) -----
+    int codeIdx = -1;
+    for (WORD i = 0; i < nSec; ++i) {
+        if (std::memcmp(sec[i].Name, ".pak", 4) == 0) continue;   // skip .pak / .pakc
+        bool exec = (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        bool code = (sec[i].Characteristics & IMAGE_SCN_CNT_CODE)    != 0;
+        if (!(exec || code)) continue;
+        if (std::memcmp(sec[i].Name, ".text\0\0\0", 8) == 0) { codeIdx = i; break; }
+        if (codeIdx < 0) codeIdx = i;
+    }
+    if (codeIdx < 0) return err(OBF(L"No code/.text section found.").str());
+    IMAGE_SECTION_HEADER& cs = sec[codeIdx];
+    char codeName[9] = {0}; std::memcpy(codeName, cs.Name, 8);   // cs dangles after img.resize()
+
+    uint32_t codeVA  = cs.VirtualAddress;
+    uint32_t codeOff = cs.PointerToRawData;
+    uint32_t vsz     = cs.Misc.VirtualSize ? cs.Misc.VirtualSize : cs.SizeOfRawData;
+    uint32_t codeLen = (std::min<uint32_t>)(cs.SizeOfRawData, vsz);
+    if (!codeOff || !codeLen) return err(OBF(L"Code section has no raw data.").str());
+    if ((size_t)codeOff + codeLen > img.size()) codeLen = (uint32_t)(img.size() - codeOff);
+
+    // ---- carve the code section into runs that avoid excluded bytes -----
+    uint32_t globalSeed = (uint32_t)(opt.AddressOfEntryPoint * 2654435761u + 0x5eed1234u);
+    auto seedFor = [&](uint32_t rva) {
+        uint32_t s = rva * 2246822519u + globalSeed + 0x9e3779b9u;
+        return s ? s : 0xA5A5A5A5u;
+    };
+    std::vector<PackRange> ranges;
+    uint32_t endRVA = codeVA + codeLen;
+    for (uint32_t p = codeVA; p < endRVA;) {
+        bool inside = false; uint32_t curEnd = p, nextBeg = endRVA;
+        for (auto& s : ex) {
+            if (p >= s.beg && p < s.end) { inside = true; if (s.end > curEnd) curEnd = s.end; }
+            else if (s.beg > p && s.beg < nextBeg) nextBeg = s.beg;
+        }
+        if (inside) { p = (std::min)(curEnd, endRVA); continue; }
+        uint32_t runEnd = (std::min)(nextBeg, endRVA);
+        if (runEnd > p) ranges.push_back({ p, runEnd - p, seedFor(p), codeOff + (p - codeVA) });
+        p = runEnd;
+    }
+    if (ranges.empty()) return err(OBF(L"Nothing encryptable in the code section.").str());
+
+    // ---- encrypt in place (advance-then-use keystream, matches the stub) -
+    for (auto& r : ranges) {
+        uint32_t st = r.seed;
+        for (uint32_t j = 0; j < r.len; ++j) { st = xorshift32(st); img[r.fileOff + j] ^= (uint8_t)st; }
+    }
+    cs.Characteristics |= IMAGE_SCN_MEM_WRITE;   // let the loader map .text RWX
+
+    // ---- assemble the .pakc section (stub + table [+ TLS callback array]) -
+    size_t offT, offC;
+    std::vector<BYTE> stub = hookTls ? MakeTlsStub(offT, offC)
+                                     : std::vector<BYTE>(kStub, kStub + kStubLen);
+    if (!hookTls) { offT = kOffTable; offC = kOffCount; }
+
+    const size_t stubLen     = stub.size();
+    const size_t tableSize   = ranges.size() * 16;
+    const size_t cbArrSize   = hookTls ? (tlsCallbacks.size() + 2) * 8 : 0;
+    const size_t contentSize = stubLen + tableSize + cbArrSize;
+
+    uint32_t secTabOff = peOff + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
+    uint32_t secTabEnd = secTabOff + (uint32_t)nSec * sizeof(IMAGE_SECTION_HEADER);
+    if (secTabEnd + sizeof(IMAGE_SECTION_HEADER) > opt.SizeOfHeaders)
+        return err(OBF(L"No room in the header for a new section (unsupported layout).").str());
+
+    uint32_t maxEnd = 0;
+    for (WORD i = 0; i < nSec; ++i)
+        maxEnd = (std::max<uint32_t>)(maxEnd, sec[i].VirtualAddress +
+                 (std::max)(sec[i].Misc.VirtualSize, sec[i].SizeOfRawData));
+    uint32_t newVA  = (uint32_t)alignUp(maxEnd, secAlign);
+    uint32_t rawPtr = (uint32_t)alignUp(img.size(), fileAlign);
+    uint32_t rawSz  = (uint32_t)alignUp(contentSize, fileAlign);
+
+    uint64_t tableVA = imageBase + newVA + stubLen;
+    uint64_t oepVA   = imageBase + opt.AddressOfEntryPoint;   // current entry (chains)
+
+    std::vector<BYTE> content(contentSize, 0);
+    std::memcpy(content.data(), stub.data(), stubLen);
+    std::memcpy(content.data() + offT, &tableVA, 8);
+    uint32_t cnt = (uint32_t)ranges.size();
+    std::memcpy(content.data() + offC, &cnt, 4);
+    if (!hookTls) std::memcpy(content.data() + kOffOep, &oepVA, 8);
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        uint64_t absVA = imageBase + ranges[i].rva;
+        BYTE* e = content.data() + stubLen + i * 16;
+        std::memcpy(e + 0, &absVA, 8);
+        std::memcpy(e + 8, &ranges[i].len,  4);
+        std::memcpy(e + 12, &ranges[i].seed, 4);
+    }
+    uint64_t newCbArrVA = 0;
+    if (hookTls) {
+        BYTE* a = content.data() + stubLen + tableSize;
+        uint64_t mine = imageBase + newVA;                   // our callback = stub start
+        std::memcpy(a, &mine, 8);
+        for (size_t i = 0; i < tlsCallbacks.size(); ++i)
+            std::memcpy(a + (i + 1) * 8, &tlsCallbacks[i], 8);
+        newCbArrVA = imageBase + newVA + stubLen + tableSize;  // trailing 8 bytes = null terminator
+    }
+
+    IMAGE_SECTION_HEADER nh = {};
+    std::memcpy(nh.Name, ".pakc\0\0", 8);
+    nh.Misc.VirtualSize = (DWORD)contentSize;
+    nh.VirtualAddress   = newVA;
+    nh.SizeOfRawData    = rawSz;
+    nh.PointerToRawData = rawPtr;
+    nh.Characteristics  = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    std::memcpy(at(secTabEnd), &nh, sizeof(nh));
+
+    nt->FileHeader.NumberOfSections = nSec + 1;
+    opt.SizeOfImage = (DWORD)alignUp(newVA + contentSize, secAlign);
+    opt.DllCharacteristics &= ~(IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
+                                IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA |
+                                IMAGE_DLLCHARACTERISTICS_GUARD_CF);
+    if (!hookTls) opt.AddressOfEntryPoint = newVA;   // entry-point form: run the stub first
+
+    img.resize(rawPtr + rawSz, 0);
+    std::memcpy(img.data() + rawPtr, content.data(), contentSize);
+    if (hookTls) {   // repoint the callback array at our prepended copy (after resize)
+        size_t cbField = tlsDirFileOff + offsetof(IMAGE_TLS_DIRECTORY64, AddressOfCallBacks);
+        std::memcpy(img.data() + cbField, &newCbArrVA, 8);
+    }
+
+    if (!WriteFileBytes(outPath, img)) return err(OBF(L"Could not write the output file.").str());
+
+    uint64_t bytesEnc = 0; for (auto& r : ranges) bytesEnc += r.len;
+    std::wstring secW;
+    for (int i = 0; i < 8 && codeName[i]; ++i) secW += (wchar_t)(unsigned char)codeName[i];
+    std::wostringstream m;
+    m << OBF(L"Code encryption complete.\r\n\r\n")
+      << OBF(L"Encrypted section \"") << secW << OBF(L"\": ")
+      << bytesEnc << OBF(L" bytes in ") << ranges.size() << OBF(L" run(s).\r\n")
+      << OBF(L"Decryptor hooked via ")
+      << (hookTls ? OBF(L"a TLS callback (ahead of the target's own).\r\n").str()
+                  : OBF(L"the entry point.\r\n").str())
+      << OBF(L"Added a ") << contentSize << OBF(L"-byte .pakc stub.\r\n\r\n")
+      << OBF(L"Saved:\r\n") << outPath;
+    return PackResult{ true, m.str() };
+}
+
+// Suggest "<name><suffix>.exe" next to the input, for the Save dialog.
+static std::wstring DefaultOutputName(const std::wstring& in, const wchar_t* suffix) {
     size_t dot   = in.find_last_of(L'.');
     size_t slash = in.find_last_of(L"\\/");
     std::wstring stem = (dot != std::wstring::npos &&
                          (slash == std::wstring::npos || dot > slash))
                         ? in.substr(0, dot) : in;
-    return stem + L"_protected.exe";
+    return stem + suffix + L".exe";
 }
 
 // ---- UI ------------------------------------------------------------------
@@ -644,6 +938,16 @@ static std::wstring SaveProtectedAs(HWND owner, const std::wstring& suggested) {
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
     if (GetSaveFileNameW(&ofn)) return file;
     return L"";
+}
+
+// A unique scratch path in %TEMP%, used to hold the intermediate when the
+// "Protect (both)" button chains the two passes (PackStrings -> PackCode).
+static std::wstring MakeTempExe() {
+    wchar_t dir[MAX_PATH]; DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (!n || n > MAX_PATH) return L"";
+    wchar_t file[MAX_PATH];
+    if (!GetTempFileNameW(dir, L"exp", 0, file)) return L"";
+    return file;
 }
 
 static std::wstring BrowseForExe(HWND owner) {
@@ -666,15 +970,20 @@ static std::wstring BrowseForExe(HWND owner) {
 
 static void LayoutChildren(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
-    const int pad = 10, browseW = 90, encW = 130, rowH = 26;
+    const int pad = 10, browseW = 90, protW = 140, rowH = 26, gap = 8;
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    int encX    = w - encW - pad;
-    int browseX = encX - browseW - pad;
-    MoveWindow(g_hPath, pad, pad, browseX - 2 * pad, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_BROWSE),  browseX, pad, browseW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_ENCRYPT), encX,    pad, encW,    rowH, TRUE);
-    MoveWindow(g_hInfo, pad, pad + rowH + pad, w - 2 * pad,
-               h - (pad + rowH + pad) - pad, TRUE);
+    // Row 1: path edit + Browse.
+    MoveWindow(g_hPath, pad, pad, w - browseW - 3 * pad, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_BROWSE), w - browseW - pad, pad, browseW, rowH, TRUE);
+    // Row 2: the combined pass (primary) then the two individual passes.
+    int row2 = pad + rowH + pad;
+    int x = pad;
+    MoveWindow(GetDlgItem(hwnd, IDC_PROTECT), x, row2, protW, rowH, TRUE); x += protW + gap;
+    MoveWindow(GetDlgItem(hwnd, IDC_ENCRYPT), x, row2, protW, rowH, TRUE); x += protW + gap;
+    MoveWindow(GetDlgItem(hwnd, IDC_ENCCODE), x, row2, protW, rowH, TRUE);
+    // Report pane fills the rest.
+    int infoY = row2 + rowH + pad;
+    MoveWindow(g_hInfo, pad, infoY, w - 2 * pad, h - infoY - pad, TRUE);
 }
 
 static void LoadAndShow(const std::wstring& path) {
@@ -701,15 +1010,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, OBF(L"BUTTON"), OBF(L"Encrypt strings"),
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
             0,0,0,0, hwnd, (HMENU)IDC_ENCRYPT, nullptr, nullptr);
+        CreateWindowExW(0, OBF(L"BUTTON"), OBF(L"Encrypt code"),
+            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            0,0,0,0, hwnd, (HMENU)IDC_ENCCODE, nullptr, nullptr);
+        CreateWindowExW(0, OBF(L"BUTTON"), OBF(L"Protect (both)"),
+            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|BS_DEFPUSHBUTTON,
+            0,0,0,0, hwnd, (HMENU)IDC_PROTECT, nullptr, nullptr);
         g_hInfo = CreateWindowExW(WS_EX_CLIENTEDGE, OBF(L"EDIT"),
             OBF(L"Click “Browse…”, or drag an .exe onto this window, to see its PE structure.\r\n"
-                L"Then click “Encrypt strings” to write a protected copy with its strings encrypted."),
+                L"“Protect (both)” encrypts its strings and its code in one step so IDA shows only "
+                L"garbage until the program runs — or use “Encrypt strings” / “Encrypt code” on their own."),
             WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
             0,0,0,0, hwnd, (HMENU)IDC_INFO, nullptr, nullptr);
 
         SendMessageW(g_hPath, WM_SETFONT, (WPARAM)g_uiFont, TRUE);
         SendMessageW(GetDlgItem(hwnd, IDC_BROWSE),  WM_SETFONT, (WPARAM)g_uiFont, TRUE);
         SendMessageW(GetDlgItem(hwnd, IDC_ENCRYPT), WM_SETFONT, (WPARAM)g_uiFont, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_ENCCODE), WM_SETFONT, (WPARAM)g_uiFont, TRUE);
+        SendMessageW(GetDlgItem(hwnd, IDC_PROTECT), WM_SETFONT, (WPARAM)g_uiFont, TRUE);
         SendMessageW(g_hInfo, WM_SETFONT, (WPARAM)g_monoFont, TRUE);
         DragAcceptFiles(hwnd, TRUE);
         return 0;
@@ -743,13 +1061,63 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             OBF(L"Encrypt strings"), MB_OK | MB_ICONINFORMATION);
                 return 0;
             }
-            std::wstring out = SaveProtectedAs(hwnd, DefaultProtectedName(g_currentPath));
+            std::wstring out = SaveProtectedAs(hwnd, DefaultOutputName(g_currentPath, L"_strenc"));
             if (out.empty()) return 0;   // user cancelled the Save dialog
             PackResult res = PackStrings(g_currentPath, out);
             MessageBoxW(hwnd, res.message.c_str(),
                         res.ok ? OBF(L"Done") : OBF(L"Encrypt strings — failed"),
                         MB_OK | (res.ok ? MB_ICONINFORMATION : MB_ICONERROR));
             if (res.ok) LoadAndShow(out);   // re-inspect the protected copy
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_ENCCODE && HIWORD(wp) == BN_CLICKED) {
+            if (g_currentPath.empty()) {
+                MessageBoxW(hwnd, OBF(L"Load an .exe first (Browse… or drag one in)."),
+                            OBF(L"Encrypt code"), MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            std::wstring out = SaveProtectedAs(hwnd, DefaultOutputName(g_currentPath, L"_codeenc"));
+            if (out.empty()) return 0;   // user cancelled the Save dialog
+            PackResult res = PackCode(g_currentPath, out);
+            MessageBoxW(hwnd, res.message.c_str(),
+                        res.ok ? OBF(L"Done") : OBF(L"Encrypt code — failed"),
+                        MB_OK | (res.ok ? MB_ICONINFORMATION : MB_ICONERROR));
+            if (res.ok) LoadAndShow(out);   // re-inspect the protected copy
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_PROTECT && HIWORD(wp) == BN_CLICKED) {
+            if (g_currentPath.empty()) {
+                MessageBoxW(hwnd, OBF(L"Load an .exe first (Browse… or drag one in)."),
+                            OBF(L"Protect"), MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            std::wstring out = SaveProtectedAs(hwnd, DefaultOutputName(g_currentPath, L"_protected"));
+            if (out.empty()) return 0;   // user cancelled the Save dialog
+            std::wstring tmp = MakeTempExe();
+            if (tmp.empty()) {
+                MessageBoxW(hwnd, OBF(L"Could not create a temporary file."),
+                            OBF(L"Protect — failed"), MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            // Pass 1: strings -> temp. If it finds nothing (or the file already
+            // has strings packed), fall back to code-encrypting the original so
+            // "both" still protects what it can.
+            PackResult r1 = PackStrings(g_currentPath, tmp);
+            std::wstring codeInput = r1.ok ? tmp : g_currentPath;
+            // Pass 2: code -> output.
+            PackResult r2 = PackCode(codeInput, out);
+            DeleteFileW(tmp.c_str());
+            if (!r2.ok) {
+                MessageBoxW(hwnd, r2.message.c_str(),
+                            OBF(L"Protect — failed"), MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            std::wstring msg = r1.ok
+                ? OBF(L"Both passes applied — strings and code are now encrypted.\r\n\r\n").str()
+                : (OBF(L"Code encrypted. Strings pass was skipped:\r\n").str() + r1.message + L"\r\n\r\n");
+            msg += OBF(L"Saved:\r\n").str() + out;
+            MessageBoxW(hwnd, msg.c_str(), OBF(L"Done"), MB_OK | MB_ICONINFORMATION);
+            LoadAndShow(out);
             return 0;
         }
         break;
