@@ -92,10 +92,18 @@ static inline void pakp_xor(uint8_t* buf, uint32_t len,
 
 void unpack(const Ent* t, uint32_t n, const uint32_t* key) {
     // ---- anti-debug: read the PEB directly (no API), fold into the key -----
-    uint64_t peb;
+    // PEB base and NtGlobalFlag offset differ by architecture: x64 = GS:[0x60],
+    // NtGlobalFlag +0xBC;  x86 = FS:[0x30], NtGlobalFlag +0x68. BeingDebugged is
+    // at +0x02 on both.
+    uintptr_t peb;
+#if defined(__x86_64__)
     __asm__ volatile ("movq %%gs:0x60, %0" : "=r"(peb));
-    uint32_t being = *(volatile uint8_t*)(peb + 0x02);   // PEB->BeingDebugged
     uint32_t ntgf  = *(volatile uint32_t*)(peb + 0xBC);  // PEB->NtGlobalFlag
+#else
+    __asm__ volatile ("movl %%fs:0x30, %0" : "=r"(peb));
+    uint32_t ntgf  = *(volatile uint32_t*)(peb + 0x68);  // PEB->NtGlobalFlag
+#endif
+    uint32_t being = *(volatile uint8_t*)(peb + 0x02);   // PEB->BeingDebugged
     // mask = 0 when clean, 0xFFFFFFFF when a debugger is present.
     uint32_t mask = 0u - (uint32_t)((being | (ntgf & 0x70u)) != 0u);
     uint32_t k[8];
@@ -103,12 +111,12 @@ void unpack(const Ent* t, uint32_t n, const uint32_t* key) {
         k[i] = key[i] ^ (mask & (0x9e3779b9u + (uint32_t)i * 0x61c88647u));
 
     for (uint32_t i = 0; i < n; ++i) {
-        uint8_t* s0 = (uint8_t*)t[i].src;
+        uint8_t* s0 = (uint8_t*)(uintptr_t)t[i].src;   // absolute VA (u64 field; 32-bit on x86)
         pakp_xor(s0, t[i].clen, k, t[i].nonce);   // decrypt in place (perturbed if debugged)
 
         const uint8_t* s  = s0;
         const uint8_t* se = s0 + t[i].clen;
-        uint8_t*       d  = (uint8_t*)t[i].dst;
+        uint8_t*       d  = (uint8_t*)(uintptr_t)t[i].dst;
         uint8_t*       de = d + t[i].olen;        // output bound (hardening)
         while (s < se && d < de) {
             uint8_t fl = *s++;

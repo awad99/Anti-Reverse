@@ -37,10 +37,11 @@
 // the Windows loader still has everything it needs before the stub runs. It
 // composes with strcrypt/codeenc (distinct section names; stubs chain).
 //
-// Scope / limits (honest): x64 native PE only (PE32+, AMD64). Refuses 32-bit,
-// DLLs, .NET and files it has already packed. Defeats STATIC analysis only — a
-// debugger or a memory dump after startup recovers everything. For protecting
-// software you own; always test the output.
+// Scope / limits (honest): native PE EXEs — both x64 (PE32+, AMD64, x86-64 stub)
+// and x86 (PE32, i386, x86 stub); dispatched on the machine field. Refuses DLLs,
+// .NET and files it has already packed. Defeats STATIC analysis only — a debugger
+// or a memory dump after startup recovers everything. For protecting software you
+// own; always test the output.
 //
 // Build (MSYS2 UCRT64):  g++ -O2 -std=c++17 -o pack.exe pack.cpp
 
@@ -53,6 +54,7 @@
 #include <vector>
 #include <algorithm>
 #include <random>
+#include <type_traits>
 #include "pak_core.h"
 
 struct Span { uint32_t beg; uint32_t end; };
@@ -62,32 +64,31 @@ static bool overlaps(const std::vector<Span>& ex, uint32_t beg, uint32_t end) {
 }
 static void fail(const char* m) { std::fprintf(stderr, "pack: %s\n", m); std::exit(1); }
 
-int main(int argc, char** argv) {
-    if (argc != 3) { std::fprintf(stderr, "usage: pack <input.exe> <output.exe>\n"); return 2; }
-
-    FILE* f = std::fopen(argv[1], "rb");
-    if (!f) fail("cannot open input");
-    std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
-    if (sz <= 0) fail("empty input");
-    std::vector<uint8_t> img(static_cast<size_t>(sz));
-    if (std::fread(img.data(), 1, img.size(), f) != img.size()) fail("read error");
-    std::fclose(f);
+// The packer core, parameterized on architecture. X64 => PE32+/AMD64 with an
+// x86-64 stub; !X64 => PE32/i386 with the x86 stub. The two differ only in the
+// header struct types, the pointer width PW (stub patch slots, the TLS callback
+// array, import thunks, the TLS AddressOfCallBacks field) and the ordinal flag;
+// the Ent table stays 32 bytes on both (32-bit VAs zero-extend into its u64s).
+template<bool X64>
+static int packImpl(std::vector<uint8_t>& img, const char* outPath, long sz) {
+    using NT  = std::conditional_t<X64, IMAGE_NT_HEADERS64,     IMAGE_NT_HEADERS32>;
+    using OPT = std::conditional_t<X64, IMAGE_OPTIONAL_HEADER64, IMAGE_OPTIONAL_HEADER32>;
+    using TLS = std::conditional_t<X64, IMAGE_TLS_DIRECTORY64,   IMAGE_TLS_DIRECTORY32>;
+    constexpr int      PW  = X64 ? 8 : 4;
+    constexpr uint64_t ORD = X64 ? IMAGE_ORDINAL_FLAG64 : (uint64_t)IMAGE_ORDINAL_FLAG32;
+    constexpr WORD     MAG = X64 ? IMAGE_NT_OPTIONAL_HDR64_MAGIC : IMAGE_NT_OPTIONAL_HDR32_MAGIC;
 
     auto at = [&](size_t off) -> uint8_t* { return img.data() + off; };
     auto in = [&](size_t off, size_t len) { return off + len <= img.size(); };
 
-    if (!in(0, sizeof(IMAGE_DOS_HEADER))) fail("too small");
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(at(0));
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) fail("not a PE (no MZ)");
     DWORD peOff = dos->e_lfanew;
-    if (!in(peOff, sizeof(IMAGE_NT_HEADERS64))) fail("not a PE (truncated)");
-    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(at(peOff));
-    if (nt->Signature != IMAGE_NT_SIGNATURE) fail("not a PE (no PE00)");
-    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) fail("only x64 (AMD64) is supported");
-    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) fail("only PE32+ (64-bit) is supported");
+    if (!in(peOff, sizeof(NT))) fail("not a PE (truncated)");
+    auto nt = reinterpret_cast<NT*>(at(peOff));
+    if (nt->OptionalHeader.Magic != MAG) fail("optional-header magic does not match the machine");
     if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) fail("DLLs are not supported (EXE only)");
 
-    IMAGE_OPTIONAL_HEADER64& opt = nt->OptionalHeader;
+    OPT& opt = nt->OptionalHeader;
     if (opt.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR &&
         opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress)
         fail(".NET assemblies are not supported");
@@ -119,12 +120,12 @@ int main(int argc, char** argv) {
         auto& d = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
         if (d.VirtualAddress && d.Size) {
             uint32_t o = rvaToOff(d.VirtualAddress);
-            if (o && in(o, sizeof(IMAGE_TLS_DIRECTORY64))) {
-                auto tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(at(o));
-                if (tls->AddressOfCallBacks >= imageBase) {
-                    uint32_t arrOff = rvaToOff((uint32_t)(tls->AddressOfCallBacks - imageBase));
-                    for (uint32_t k = 0; arrOff && in(arrOff + k * 8, 8) && k < 4096; ++k) {
-                        uint64_t cb; std::memcpy(&cb, at(arrOff + k * 8), 8);
+            if (o && in(o, sizeof(TLS))) {
+                auto tls = reinterpret_cast<TLS*>(at(o));
+                if ((uint64_t)tls->AddressOfCallBacks >= imageBase) {
+                    uint32_t arrOff = rvaToOff((uint32_t)((uint64_t)tls->AddressOfCallBacks - imageBase));
+                    for (uint32_t k = 0; arrOff && in(arrOff + k * PW, PW) && k < 4096; ++k) {
+                        uint64_t cb = 0; std::memcpy(&cb, at(arrOff + k * PW), PW);
                         if (!cb) break;
                         tlsCallbacks.push_back(cb);
                     }
@@ -158,10 +159,10 @@ int main(int argc, char** argv) {
                 uint32_t arrRva = which ? imp->FirstThunk : imp->OriginalFirstThunk;
                 if (!arrRva) continue;
                 uint32_t arrOff = rvaToOff(arrRva), k = 0;
-                while (arrOff && in(arrOff + k * 8, 8)) {
-                    uint64_t t; std::memcpy(&t, at(arrOff + k * 8), 8);
+                while (arrOff && in(arrOff + k * PW, PW)) {
+                    uint64_t t = 0; std::memcpy(&t, at(arrOff + k * PW), PW);
                     if (!t) break;
-                    if (!(t & IMAGE_ORDINAL_FLAG64)) {
+                    if (!(t & ORD)) {
                         uint32_t ibnRva = (uint32_t)(t & 0x7fffffff);
                         uint32_t ibnOff = rvaToOff(ibnRva), n = 0;
                         while (ibnOff && in(ibnOff + 2 + n, 1) && img[ibnOff + 2 + n]) ++n;
@@ -169,7 +170,7 @@ int main(int argc, char** argv) {
                     }
                     ++k;
                 }
-                ex.push_back({ arrRva, arrRva + (k + 1) * 8 });
+                ex.push_back({ arrRva, arrRva + (k + 1) * PW });
             }
             off += sizeof(IMAGE_IMPORT_DESCRIPTOR);
         }
@@ -199,9 +200,6 @@ int main(int argc, char** argv) {
     for (auto& p : plans) isComp[p.idx] = true;
 
     // ---- encrypt each compressed blob in place (PAKP cipher) -----------
-    // Fresh random 256-bit key per pack -> polymorphic output; the key ships
-    // in .pakp (obfuscation-grade, not secrecy). Nonce = the blob's table index,
-    // so every (key,nonce) pair is unique within the file.
     uint32_t key[8];
     { std::random_device rd; for (int i = 0; i < 8; ++i) key[i] = rd(); }
     for (size_t i = 0; i < plans.size(); ++i)
@@ -215,12 +213,16 @@ int main(int argc, char** argv) {
     uint32_t newVA = (uint32_t)alignUp(maxEnd, secAlign);
 
     size_t offT, offC, offO = 0, offK = 0;
-    std::vector<uint8_t> stub = hookTls ? MakePakpTlsStub(offT, offC, offK)
-                                        : MakePakpEntryStub(offT, offC, offO, offK);
+    std::vector<uint8_t> stub;
+    if constexpr (X64)
+        stub = hookTls ? MakePakpTlsStub(offT, offC, offK) : MakePakpEntryStub(offT, offC, offO, offK);
+    else
+        stub = hookTls ? MakePakpTlsStub32(offT, offC, offK) : MakePakpEntryStub32(offT, offC, offO, offK);
+
     const size_t stubLen   = stub.size();
     const size_t tableSize = plans.size() * 32;      // Ent is 32 bytes (adds nonce)
     size_t blobsSize = 0; for (auto& p : plans) blobsSize += p.blob.size();
-    const size_t cbArrSize = hookTls ? (tlsCallbacks.size() + 2) * 8 : 0;
+    const size_t cbArrSize = hookTls ? (tlsCallbacks.size() + 2) * PW : 0;
     const size_t kKeyLen   = 32;                     // 256-bit PAKP key
     const size_t keyOff    = stubLen + tableSize + blobsSize + cbArrSize;
     const size_t contentSize = keyOff + kKeyLen;
@@ -231,14 +233,14 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> content(contentSize, 0);
     std::memcpy(content.data(), stub.data(), stubLen);
-    std::memcpy(content.data() + offT, &tableVA, 8);
+    std::memcpy(content.data() + offT, &tableVA, PW);
     uint32_t cnt = (uint32_t)plans.size();
     std::memcpy(content.data() + offC, &cnt, 4);
-    if (!hookTls) std::memcpy(content.data() + offO, &oepVA, 8);
-    std::memcpy(content.data() + offK, &keyVA, 8);
+    if (!hookTls) std::memcpy(content.data() + offO, &oepVA, PW);
+    std::memcpy(content.data() + offK, &keyVA, PW);
     std::memcpy(content.data() + keyOff, key, kKeyLen);
 
-    // table entries + blobs
+    // table entries (32-byte Ent; VAs stored as u64, truncated by the stub on x86) + blobs
     size_t blobCursor = stubLen + tableSize;
     for (size_t i = 0; i < plans.size(); ++i) {
         uint64_t dstVA = imageBase + sec[plans[i].idx].VirtualAddress;
@@ -259,14 +261,14 @@ int main(int argc, char** argv) {
     if (hookTls) {
         uint8_t* a = content.data() + stubLen + tableSize + blobsSize;
         uint64_t mine = imageBase + newVA;
-        std::memcpy(a, &mine, 8);
+        std::memcpy(a, &mine, PW);                   // our callback first (pointer-wide)
         for (size_t i = 0; i < tlsCallbacks.size(); ++i)
-            std::memcpy(a + (i + 1) * 8, &tlsCallbacks[i], 8);
+            std::memcpy(a + (i + 1) * PW, &tlsCallbacks[i], PW);
         newCbArrVA = imageBase + newVA + stubLen + tableSize + blobsSize;
     }
 
     // ---- rebuild the file: headers + kept raw + .pakp ------------------
-    uint32_t secTabOff = peOff + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
+    uint32_t secTabOff = peOff + offsetof(NT, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
     uint32_t secTabEnd = secTabOff + (uint32_t)nSec * sizeof(IMAGE_SECTION_HEADER);
     if (secTabEnd + sizeof(IMAGE_SECTION_HEADER) > opt.SizeOfHeaders)
         fail("no room in header for a new section (unsupported layout)");
@@ -291,7 +293,7 @@ int main(int argc, char** argv) {
     out.resize(pakpPtr + pakpRaw, 0);
 
     // ---- patch headers in the rebuilt image (no more resizing) ---------
-    auto nt2  = reinterpret_cast<IMAGE_NT_HEADERS64*>(out.data() + peOff);
+    auto nt2  = reinterpret_cast<NT*>(out.data() + peOff);
     auto sec2 = IMAGE_FIRST_SECTION(nt2);
     for (WORD i = 0; i < nSec; ++i) {
         if (isComp[i]) {
@@ -335,22 +337,48 @@ int main(int argc, char** argv) {
         };
         uint32_t to = rvaToNewOff(tlsDirRva);
         if (!to) fail("could not relocate TLS directory (unsupported layout)");
-        size_t cbField = to + offsetof(IMAGE_TLS_DIRECTORY64, AddressOfCallBacks);
-        std::memcpy(out.data() + cbField, &newCbArrVA, 8);
+        size_t cbField = to + offsetof(TLS, AddressOfCallBacks);
+        std::memcpy(out.data() + cbField, &newCbArrVA, PW);
     }
 
-    FILE* o = std::fopen(argv[2], "wb");
+    FILE* o = std::fopen(outPath, "wb");
     if (!o) fail("cannot open output");
     if (std::fwrite(out.data(), 1, out.size(), o) != out.size()) fail("write error");
     std::fclose(o);
 
     uint64_t origBytes = 0, compBytes = 0;
     for (auto& p : plans) { origBytes += p.origLen; compBytes += p.blob.size(); }
-    std::printf("pack: compressed %zu section(s): %llu -> %llu bytes (%.1f%%).\n",
-                plans.size(), (unsigned long long)origBytes, (unsigned long long)compBytes,
+    std::printf("pack: %s; compressed %zu section(s): %llu -> %llu bytes (%.1f%%).\n",
+                X64 ? "x64" : "x86", plans.size(),
+                (unsigned long long)origBytes, (unsigned long long)compBytes,
                 origBytes ? 100.0 * compBytes / origBytes : 0.0);
     std::printf("pack: file %ld -> %zu bytes; hooked via %s.\n",
                 sz, out.size(), hookTls ? "TLS callback" : "entry point");
-    std::printf("pack: wrote %s\n", argv[2]);
+    std::printf("pack: wrote %s\n", outPath);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 3) { std::fprintf(stderr, "usage: pack <input.exe> <output.exe>\n"); return 2; }
+
+    FILE* f = std::fopen(argv[1], "rb");
+    if (!f) fail("cannot open input");
+    std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    if (sz <= 0) fail("empty input");
+    std::vector<uint8_t> img(static_cast<size_t>(sz));
+    if (std::fread(img.data(), 1, img.size(), f) != img.size()) fail("read error");
+    std::fclose(f);
+
+    if (img.size() < sizeof(IMAGE_DOS_HEADER)) fail("too small");
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) fail("not a PE (no MZ)");
+    DWORD peOff = dos->e_lfanew;
+    if ((size_t)peOff + 6 > img.size()) fail("not a PE (truncated)");
+    if (*reinterpret_cast<DWORD*>(img.data() + peOff) != IMAGE_NT_SIGNATURE) fail("not a PE (no PE00)");
+    WORD machine = *reinterpret_cast<WORD*>(img.data() + peOff + 4);
+
+    if (machine == IMAGE_FILE_MACHINE_AMD64) return packImpl<true>(img, argv[2], sz);
+    if (machine == IMAGE_FILE_MACHINE_I386)  return packImpl<false>(img, argv[2], sz);
+    fail("only x64 (AMD64) and x86 (i386) executables are supported");
+    return 1;
 }
