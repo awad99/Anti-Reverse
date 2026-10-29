@@ -1,0 +1,9 @@
+# build artifacts
+*.exe
+*.o
+*.obj
+*.bin
+build/
+# test scratch
+test/*.exe
+.build-tmp/
